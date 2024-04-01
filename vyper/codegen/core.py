@@ -152,29 +152,30 @@ def make_byte_array_copier(dst, src):
         # set length word to 0.
         return STORE(dst, 0)
 
-    with src.cache_when_complex("src") as (b1, src):
-        has_storage = STORAGE in (src.location, dst.location)
-        is_memory_copy = dst.location == src.location == MEMORY
-        batch_uses_identity = is_memory_copy and not version_check(begin="cancun")
-        if src.typ.maxlen <= 32 and (has_storage or batch_uses_identity):
-            # it's cheaper to run two load/stores instead of copy_bytes
+    src = src.ir_var("src") # src has a parent from previous call
+    has_storage = STORAGE in (src.location, dst.location)
+    is_memory_copy = dst.location == src.location == MEMORY
+    batch_uses_identity = is_memory_copy and not version_check(begin="cancun")
+    if src.typ.maxlen <= 32 and (has_storage or batch_uses_identity):
+        # it's cheaper to run two load/stores instead of copy_bytes
 
-            ret = ["seq"]
-            # store length word
-            len_ = get_bytearray_length(src)
-            ret.append(STORE(dst, len_))
+        ret = ["seq"]
+        # store length word
+        len_ = get_bytearray_length(src)
+        ret.append(STORE(dst, len_))
 
-            # store the single data word.
-            dst_data_ptr = bytes_data_ptr(dst)
-            src_data_ptr = bytes_data_ptr(src)
-            ret.append(STORE(dst_data_ptr, LOAD(src_data_ptr)))
-            return b1.resolve(ret)
+        # store the single data word.
+        dst_data_ptr = bytes_data_ptr(dst)
+        src_data_ptr = bytes_data_ptr(src)
+        ret.append(STORE(dst_data_ptr, LOAD(src_data_ptr)))
+        return src.resolve(ret)
 
-        # batch copy the bytearray (including length word) using copy_bytes
-        len_ = add_ofst(get_bytearray_length(src), 32)
-        max_bytes = src.typ.maxlen + 32
-        ret = copy_bytes(dst, src, len_, max_bytes)
-        return b1.resolve(ret)
+    # batch copy the bytearray (including length word) using copy_bytes
+    len_ = add_ofst(get_bytearray_length(src), 32)
+    max_bytes = src.typ.maxlen + 32
+    ret = copy_bytes(dst, src, len_, max_bytes)
+    ret = src.resolve(ret)
+    return ret
 
 
 def bytes_data_ptr(ptr):
@@ -228,50 +229,49 @@ def _dynarray_make_setter(dst, src):
 
         return ret
 
-    with src.cache_when_complex("darray_src") as (b1, src):
-        # for ABI-encoded dynamic data, we must loop to unpack, since
-        # the layout does not match our memory layout
-        should_loop = src.encoding == Encoding.ABI and src.typ.value_type.abi_type.is_dynamic()
+    src = src.ir_var("darray_src")
+    # for ABI-encoded dynamic data, we must loop to unpack, since
+    # the layout does not match our memory layout
+    should_loop = src.encoding == Encoding.ABI and src.typ.value_type.abi_type.is_dynamic()
 
-        # if the data is not validated, we must loop to unpack
-        should_loop |= needs_clamp(src.typ.value_type, src.encoding)
+    # if the data is not validated, we must loop to unpack
+    should_loop |= needs_clamp(src.typ.value_type, src.encoding)
 
-        # performance: if the subtype is dynamic, there might be a lot
-        # of unused space inside of each element. for instance
-        # DynArray[DynArray[uint256, 100], 5] where all the child
-        # arrays are empty - for this case, we recursively call
-        # into make_setter instead of straight bytes copy
-        # TODO we can make this heuristic more precise, e.g.
-        # loop when subtype.is_dynamic AND location == storage
-        # OR array_size <= /bound where loop is cheaper than memcpy/
-        should_loop |= src.typ.value_type.abi_type.is_dynamic()
+    # performance: if the subtype is dynamic, there might be a lot
+    # of unused space inside of each element. for instance
+    # DynArray[DynArray[uint256, 100], 5] where all the child
+    # arrays are empty - for this case, we recursively call
+    # into make_setter instead of straight bytes copy
+    # TODO we can make this heuristic more precise, e.g.
+    # loop when subtype.is_dynamic AND location == storage
+    # OR array_size <= /bound where loop is cheaper than memcpy/
+    should_loop |= src.typ.value_type.abi_type.is_dynamic()
+    count = get_dyn_array_count(src).ir_var("darray_count")
+    ret = ["seq"]
 
-        with get_dyn_array_count(src).cache_when_complex("darray_count") as (b2, count):
-            ret = ["seq"]
+    if should_loop:
+        i = IRnode.from_list(_freshname("copy_darray_ix"), typ=UINT256_T)
 
-            if should_loop:
-                i = IRnode.from_list(_freshname("copy_darray_ix"), typ=UINT256_T)
+        loop_body = make_setter(
+            get_element_ptr(dst, i, array_bounds_check=False),
+            get_element_ptr(src, i, array_bounds_check=False),
+        )
+        loop_body.annotation = f"{dst}[i] = {src}[i]"
 
-                loop_body = make_setter(
-                    get_element_ptr(dst, i, array_bounds_check=False),
-                    get_element_ptr(src, i, array_bounds_check=False),
-                )
-                loop_body.annotation = f"{dst}[i] = {src}[i]"
+        ret.append(["repeat", i, 0, count, src.typ.count, loop_body])
+        # write the length word after data is copied
+        ret.append(STORE(dst, count))
 
-                ret.append(["repeat", i, 0, count, src.typ.count, loop_body])
-                # write the length word after data is copied
-                ret.append(STORE(dst, count))
+    else:
+        element_size = src.typ.value_type.memory_bytes_required
+        # number of elements * size of element in bytes + length word
+        n_bytes = add_ofst(_mul(count, element_size), 32)
+        max_bytes = 32 + src.typ.count * element_size
 
-            else:
-                element_size = src.typ.value_type.memory_bytes_required
-                # number of elements * size of element in bytes + length word
-                n_bytes = add_ofst(_mul(count, element_size), 32)
-                max_bytes = 32 + src.typ.count * element_size
+        # batch copy the entire dynarray, including length word
+        ret.append(copy_bytes(dst, src, n_bytes, max_bytes))
 
-                # batch copy the entire dynarray, including length word
-                ret.append(copy_bytes(dst, src, n_bytes, max_bytes))
-
-            return b1.resolve(b2.resolve(ret))
+    return src.resolve(count.resolve(ret))
 
 
 # Copy bytes
@@ -286,76 +286,73 @@ def _dynarray_make_setter(dst, src):
 def copy_bytes(dst, src, length, length_bound):
     annotation = f"copy up to {length_bound} bytes from {src} to {dst}"
 
-    src = IRnode.from_list(src)
-    dst = IRnode.from_list(dst)
-    length = IRnode.from_list(length)
+    src = IRnode.from_list(src).ir_var("src")
+    length = IRnode.from_list(length).ir_var("copy_bytes_count")
+    dst = IRnode.from_list(dst).ir_var("dst")
 
-    with src.cache_when_complex("src") as (b1, src), length.cache_when_complex(
-        "copy_bytes_count"
-    ) as (b2, length), dst.cache_when_complex("dst") as (b3, dst):
-        assert isinstance(length_bound, int) and length_bound >= 0
+    assert isinstance(length_bound, int) and length_bound >= 0
 
-        # correctness: do not clobber dst
-        if length_bound == 0:
-            return IRnode.from_list(["seq"], annotation=annotation)
-        # performance: if we know that length is 0, do not copy anything
-        if length.value == 0:
-            return IRnode.from_list(["seq"], annotation=annotation)
+    # correctness: do not clobber dst
+    if length_bound == 0:
+        return IRnode.from_list(["seq"], annotation=annotation)
+    # performance: if we know that length is 0, do not copy anything
+    if length.value == 0:
+        return IRnode.from_list(["seq"], annotation=annotation)
 
-        assert src.is_pointer and dst.is_pointer
+    assert src.is_pointer and dst.is_pointer
 
-        # fast code for common case where num bytes is small
-        if length_bound <= 32:
-            copy_op = STORE(dst, LOAD(src))
-            ret = IRnode.from_list(copy_op, annotation=annotation)
-            return b1.resolve(b2.resolve(b3.resolve(ret)))
+    # fast code for common case where num bytes is small
+    if length_bound <= 32:
+        copy_op = STORE(dst, LOAD(src))
+        ret = IRnode.from_list(copy_op, annotation=annotation)
+        return src.resolve(length.resolve(dst.resolve(ret)))
 
-        if dst.location == MEMORY and src.location in (MEMORY, CALLDATA, DATA):
-            # special cases: batch copy to memory
-            # TODO: iloadbytes
-            if src.location == MEMORY:
-                if version_check(begin="cancun"):
-                    copy_op = ["mcopy", dst, src, length]
-                    gas_bound = _mcopy_gas_bound(length_bound)
-                else:
-                    copy_op = ["staticcall", "gas", 4, src, length, dst, length]
-                    gas_bound = _identity_gas_bound(length_bound)
-            elif src.location == CALLDATA:
-                copy_op = ["calldatacopy", dst, src, length]
-                gas_bound = _calldatacopy_gas_bound(length_bound)
-            elif src.location == DATA:
-                copy_op = ["dloadbytes", dst, src, length]
-                # note: dloadbytes compiles to CODECOPY
-                gas_bound = _codecopy_gas_bound(length_bound)
+    if dst.location == MEMORY and src.location in (MEMORY, CALLDATA, DATA):
+        # special cases: batch copy to memory
+        # TODO: iloadbytes
+        if src.location == MEMORY:
+            if version_check(begin="cancun"):
+                copy_op = ["mcopy", dst, src, length]
+                gas_bound = _mcopy_gas_bound(length_bound)
+            else:
+                copy_op = ["staticcall", "gas", 4, src, length, dst, length]
+                gas_bound = _identity_gas_bound(length_bound)
+        elif src.location == CALLDATA:
+            copy_op = ["calldatacopy", dst, src, length]
+            gas_bound = _calldatacopy_gas_bound(length_bound)
+        elif src.location == DATA:
+            copy_op = ["dloadbytes", dst, src, length]
+            # note: dloadbytes compiles to CODECOPY
+            gas_bound = _codecopy_gas_bound(length_bound)
 
-            ret = IRnode.from_list(copy_op, annotation=annotation, add_gas_estimate=gas_bound)
-            return b1.resolve(b2.resolve(b3.resolve(ret)))
+        ret = IRnode.from_list(copy_op, annotation=annotation, add_gas_estimate=gas_bound)
+        return src.resolve(length.resolve(dst.resolve(ret)))
 
-        if dst.location == IMMUTABLES and src.location in (MEMORY, DATA):
-            # TODO istorebytes-from-mem, istorebytes-from-calldata(?)
-            # compile to identity, CODECOPY respectively.
-            pass
+    if dst.location == IMMUTABLES and src.location in (MEMORY, DATA):
+        # TODO istorebytes-from-mem, istorebytes-from-calldata(?)
+        # compile to identity, CODECOPY respectively.
+        pass
 
-        # general case, copy word-for-word
-        # pseudocode for our approach (memory-storage as example):
-        # for i in range(len, bound=MAX_LEN):
-        #   sstore(_dst + i, mload(src + i * 32))
-        i = IRnode.from_list(_freshname("copy_bytes_ix"), typ=UINT256_T)
+    # general case, copy word-for-word
+    # pseudocode for our approach (memory-storage as example):
+    # for i in range(len, bound=MAX_LEN):
+    #   sstore(_dst + i, mload(src + i * 32))
+    i = IRnode.from_list(_freshname("copy_bytes_ix"), typ=UINT256_T)
 
-        # optimized form of (div (ceil32 len) 32)
-        n = ["div", ["add", 31, length], 32]
-        n_bound = ceil32(length_bound) // 32
+    # optimized form of (div (ceil32 len) 32)
+    n = ["div", ["add", 31, length], 32]
+    n_bound = ceil32(length_bound) // 32
 
-        dst_i = add_ofst(dst, _mul(i, dst.location.word_scale))
-        src_i = add_ofst(src, _mul(i, src.location.word_scale))
+    dst_i = add_ofst(dst, _mul(i, dst.location.word_scale))
+    src_i = add_ofst(src, _mul(i, src.location.word_scale))
 
-        copy_one_word = STORE(dst_i, LOAD(src_i))
+    copy_one_word = STORE(dst_i, LOAD(src_i))
 
-        main_loop = ["repeat", i, 0, n, n_bound, copy_one_word]
+    main_loop = ["repeat", i, 0, n, n_bound, copy_one_word]
 
-        return b1.resolve(
-            b2.resolve(b3.resolve(IRnode.from_list(main_loop, annotation=annotation)))
-        )
+    return src.resolve(
+        length.resolve(dst.resolve(IRnode.from_list(main_loop, annotation=annotation)))
+    )
 
 
 # get the number of bytes at runtime
@@ -392,44 +389,40 @@ def append_dyn_array(darray_node, elem_node):
     assert darray_node.typ.count > 0, "jerk boy u r out"
 
     ret = ["seq"]
-    with darray_node.cache_when_complex("darray") as (b1, darray_node):
-        len_ = get_dyn_array_count(darray_node)
-        with len_.cache_when_complex("old_darray_len") as (b2, len_):
-            assertion = ["assert", ["lt", len_, darray_node.typ.count]]
-            ret.append(IRnode.from_list(assertion, error_msg=f"{darray_node.typ} bounds check"))
-            # NOTE: typechecks elem_node
-            # NOTE skip array bounds check bc we already asserted len two lines up
-            ret.append(
-                make_setter(get_element_ptr(darray_node, len_, array_bounds_check=False), elem_node)
-            )
+    darray_node = darray_node.ir_var("darray")
+    len_ = get_dyn_array_count(darray_node).ir_var("old_darray_len")
+    assertion = ["assert", ["lt", len_, darray_node.typ.count]]
+    ret.append(IRnode.from_list(assertion, error_msg=f"{darray_node.typ} bounds check"))
+    # NOTE: typechecks elem_node
+    # NOTE skip array bounds check bc we already asserted len two lines up
+    ret.append(
+        make_setter(get_element_ptr(darray_node, len_, array_bounds_check=False), elem_node)
+    )
 
-            # store new length
-            ret.append(STORE(darray_node, ["add", len_, 1]))
-            return IRnode.from_list(b1.resolve(b2.resolve(ret)))
+    # store new length
+    ret.append(STORE(darray_node, ["add", len_, 1]))
+    return IRnode.from_list(darray_node.resolve(len_.resolve(ret)))
 
 
 def pop_dyn_array(darray_node, return_popped_item):
     assert isinstance(darray_node.typ, DArrayT)
     assert darray_node.encoding == Encoding.VYPER
     ret = ["seq"]
-    with darray_node.cache_when_complex("darray") as (b1, darray_node):
-        old_len = clamp("gt", get_dyn_array_count(darray_node), 0)
-        new_len = IRnode.from_list(["sub", old_len, 1], typ=UINT256_T)
+    darray_node = darray_node.ir_var("darray")
+    old_len = clamp("gt", get_dyn_array_count(darray_node), 0)
+    new_len = IRnode.from_list(["sub", old_len, 1], typ=UINT256_T).ir_var("new_len")
+    ret.append(STORE(darray_node, new_len))
 
-        with new_len.cache_when_complex("new_len") as (b2, new_len):
-            # store new length
-            ret.append(STORE(darray_node, new_len))
+    # NOTE skip array bounds check bc we already asserted len two lines up
+    if return_popped_item:
+        popped_item = get_element_ptr(darray_node, new_len, array_bounds_check=False)
+        ret.append(popped_item)
+        typ = popped_item.typ
+        location = popped_item.location
+    else:
+        typ, location = None, None
 
-            # NOTE skip array bounds check bc we already asserted len two lines up
-            if return_popped_item:
-                popped_item = get_element_ptr(darray_node, new_len, array_bounds_check=False)
-                ret.append(popped_item)
-                typ = popped_item.typ
-                location = popped_item.location
-            else:
-                typ, location = None, None
-
-            return IRnode.from_list(b1.resolve(b2.resolve(ret)), typ=typ, location=location)
+    return IRnode.from_list(darray_node.resolve(new_len.resolve(ret)), typ=typ, location=location)
 
 
 # add an offset to a pointer, keeping location and encoding info
@@ -560,14 +553,14 @@ def _get_element_ptr_array(parent, key, array_bounds_check):
         bound = get_dyn_array_count(parent) if is_darray else parent.typ.count
         # NOTE: there are optimization rules for the bounds check when
         # ix or bound is literal
-        with ix.cache_when_complex("ix") as (b1, ix):
-            LT = "slt" if ix.typ.is_signed else "lt"
-            # note: this is optimized out for unsigned integers
-            is_negative = [LT, ix, 0]
-            # always use unsigned ge, since bound is always an unsigned quantity
-            is_oob = ["ge", ix, bound]
-            checked_ix = ["seq", ["assert", ["iszero", ["or", is_negative, is_oob]]], ix]
-            ix = b1.resolve(IRnode.from_list(checked_ix))
+        ix = ix.ir_var("ix")
+        LT = "slt" if ix.typ.is_signed else "lt"
+        # note: this is optimized out for unsigned integers
+        is_negative = [LT, ix, 0]
+        # always use unsigned ge, since bound is always an unsigned quantity
+        is_oob = ["ge", ix, bound]
+        checked_ix = ["seq", ["assert", ["iszero", ["or", is_negative, is_oob]]], ix]
+        ix = ix.resolve(IRnode.from_list(checked_ix))
         ix.set_error_msg(f"{parent.typ} bounds check")
 
     if parent.encoding == Encoding.ABI:
@@ -608,22 +601,22 @@ def _get_element_ptr_mapping(parent, key):
 # an element or member variable
 # This is analogous (but not necessarily equivalent to) getelementptr in LLVM.
 def get_element_ptr(parent, key, array_bounds_check=True):
-    with parent.cache_when_complex("val") as (b, parent):
-        typ = parent.typ
+    parent = parent.ir_var("val")
+    typ = parent.typ
 
-        if is_tuple_like(typ):
-            ret = _get_element_ptr_tuplelike(parent, key)
+    if is_tuple_like(typ):
+        ret = _get_element_ptr_tuplelike(parent, key)
 
-        elif isinstance(typ, HashMapT):
-            ret = _get_element_ptr_mapping(parent, key)
+    elif isinstance(typ, HashMapT):
+        ret = _get_element_ptr_mapping(parent, key)
 
-        elif is_array_like(typ):
-            ret = _get_element_ptr_array(parent, key, array_bounds_check)
+    elif is_array_like(typ):
+        ret = _get_element_ptr_array(parent, key, array_bounds_check)
 
-        else:  # pragma: nocover
-            raise CompilerPanic(f"get_element_ptr cannot be called on {typ}")
+    else:  # pragma: nocover
+        raise CompilerPanic(f"get_element_ptr cannot be called on {typ}")
 
-        return b.resolve(ret)
+    return parent.resolve(ret)
 
 
 def LOAD(ptr: IRnode) -> IRnode:
@@ -886,9 +879,14 @@ def make_setter(left, right):
     elif isinstance(left.typ, _BytestringT):
         # TODO rethink/streamline the clamp_basetype logic
         if needs_clamp(right.typ, right.encoding):
-            with right.cache_when_complex("bs_ptr") as (b, right):
-                copier = make_byte_array_copier(left, right)
-                ret = b.resolve(["seq", clamp_bytestring(right), copier])
+            from copy import deepcopy
+            right_orig = deepcopy(right)
+            left_orig = deepcopy(left)
+
+            # right = deepcopy(right_orig).ir_var("bs_ptr") # These 2 yield different results for should_inline
+            right = right.ir_var("bs_ptr")  # These 2 yield different results for should_inline
+            copier = make_byte_array_copier(left, right) # This changes the should_inline to True.
+            ret = right.resolve(["seq", clamp_bytestring(right), copier])
         else:
             ret = make_byte_array_copier(left, right)
 
@@ -902,9 +900,9 @@ def make_setter(left, right):
 
         # TODO rethink/streamline the clamp_basetype logic
         if needs_clamp(right.typ, right.encoding):
-            with right.cache_when_complex("arr_ptr") as (b, right):
-                copier = _dynarray_make_setter(left, right)
-                ret = b.resolve(["seq", clamp_dyn_array(right), copier])
+            right = right.ir_var("arr_ptr")
+            copier = _dynarray_make_setter(left, right)
+            ret = right.resolve(["seq", clamp_dyn_array(right), copier])
         else:
             ret = _dynarray_make_setter(left, right)
 
@@ -914,7 +912,6 @@ def make_setter(left, right):
     assert isinstance(left.typ, (SArrayT, TupleT, StructT))
 
     return _complex_make_setter(left, right)
-
 
 _opt_level = OptimizationLevel.GAS
 
@@ -1028,13 +1025,14 @@ def _complex_make_setter(left, right):
             return copy_bytes(left, right, len_, len_)
 
     # general case, unroll
-    with left.cache_when_complex("_L") as (b1, left), right.cache_when_complex("_R") as (b2, right):
-        for k in keys:
-            l_i = get_element_ptr(left, k, array_bounds_check=False)
-            r_i = get_element_ptr(right, k, array_bounds_check=False)
-            ret.append(make_setter(l_i, r_i))
+    left = left.ir_var("_L")
+    right = right.ir_var("_R")
+    for k in keys:
+        l_i = get_element_ptr(left, k, array_bounds_check=False)
+        r_i = get_element_ptr(right, k, array_bounds_check=False)
+        ret.append(make_setter(l_i, r_i))
 
-        return b1.resolve(b2.resolve(IRnode.from_list(ret)))
+    return left.resolve(right.resolve(IRnode.from_list(ret)))
 
 
 def ensure_in_memory(ir_var, context):
@@ -1166,21 +1164,21 @@ def int_clamp(ir_node, bits, signed=False):
 
     u = "u" if not signed else ""
     msg = f"{u}int{bits} bounds check"
-    with ir_node.cache_when_complex("val") as (b, val):
-        if signed:
-            # example for bits==128:
-            # promote_signed_int(val, bits) is the "canonical" version of val
-            # if val is in bounds, the bits above bit 128 should be equal.
-            # (this works for both val >= 0 and val < 0. in the first case,
-            # all upper bits should be 0 if val is a valid int128,
-            # in the latter case, all upper bits should be 1.)
-            assertion = ["assert", ["eq", val, promote_signed_int(val, bits)]]
-        else:
-            assertion = ["assert", ["iszero", shr(bits, val)]]
+    val = ir_node.ir_var("val")
+    if signed:
+        # example for bits==128:
+        # promote_signed_int(val, bits) is the "canonical" version of val
+        # if val is in bounds, the bits above bit 128 should be equal.
+        # (this works for both val >= 0 and val < 0. in the first case,
+        # all upper bits should be 0 if val is a valid int128,
+        # in the latter case, all upper bits should be 1.)
+        assertion = ["assert", ["eq", val, promote_signed_int(val, bits)]]
+    else:
+        assertion = ["assert", ["iszero", shr(bits, val)]]
 
-        assertion = IRnode.from_list(assertion, error_msg=msg)
+    assertion = IRnode.from_list(assertion, error_msg=msg)
 
-        ret = b.resolve(["seq", assertion, val])
+    ret = val.resolve(["seq", assertion, val])
 
     return IRnode.from_list(ret, annotation=msg)
 
@@ -1189,9 +1187,9 @@ def bytes_clamp(ir_node: IRnode, n_bytes: int) -> IRnode:
     if not (0 < n_bytes <= 32):  # pragma: nocover
         raise CompilerPanic(f"bad type: bytes{n_bytes}")
     msg = f"bytes{n_bytes} bounds check"
-    with ir_node.cache_when_complex("val") as (b, val):
-        assertion = IRnode.from_list(["assert", ["iszero", shl(n_bytes * 8, val)]], error_msg=msg)
-        ret = b.resolve(["seq", assertion, val])
+    val = ir_node.ir_var("val")
+    assertion = IRnode.from_list(["assert", ["iszero", shl(n_bytes * 8, val)]], error_msg=msg)
+    ret = val.resolve(["seq", assertion, val])
 
     return IRnode.from_list(ret, annotation=msg)
 
@@ -1205,18 +1203,18 @@ def promote_signed_int(x, bits):
 
 # general clamp function for all ops and numbers
 def clamp(op, arg, bound):
-    with IRnode.from_list(arg).cache_when_complex("clamp_arg") as (b1, arg):
-        check = IRnode.from_list(["assert", [op, arg, bound]], error_msg=f"clamp {op} {bound}")
-        ret = ["seq", check, arg]
-        return IRnode.from_list(b1.resolve(ret), typ=arg.typ)
+    arg = IRnode.from_list(arg).ir_var("clamp_arg")
+    check = IRnode.from_list(["assert", [op, arg, bound]], error_msg=f"clamp {op} {bound}")
+    ret = ["seq", check, arg]
+    return IRnode.from_list(arg.resolve(ret), typ=arg.typ)
 
 
 def clamp_nonzero(arg):
     # TODO: use clamp("ne", arg, 0) once optimizer rules can handle it
-    with IRnode.from_list(arg).cache_when_complex("should_nonzero") as (b1, arg):
-        check = IRnode.from_list(["assert", arg], error_msg="check nonzero")
-        ret = ["seq", check, arg]
-        return IRnode.from_list(b1.resolve(ret), typ=arg.typ)
+    arg = IRnode.from_list(arg).ir_var("should_nonzero")
+    check = IRnode.from_list(["assert", arg], error_msg="check nonzero")
+    ret = ["seq", check, arg]
+    return IRnode.from_list(arg.resolve(ret), typ=arg.typ)
 
 
 def clamp_le(arg, hi, signed):
@@ -1225,8 +1223,8 @@ def clamp_le(arg, hi, signed):
 
 
 def clamp2(lo, arg, hi, signed):
-    with IRnode.from_list(arg).cache_when_complex("clamp2_arg") as (b1, arg):
-        GE = "sge" if signed else "ge"
-        LE = "sle" if signed else "le"
-        ret = ["seq", ["assert", ["and", [GE, arg, lo], [LE, arg, hi]]], arg]
-        return IRnode.from_list(b1.resolve(ret), typ=arg.typ)
+    arg = IRnode.from_list(arg).ir_var("clamp2_arg")
+    GE = "sge" if signed else "ge"
+    LE = "sle" if signed else "le"
+    ret = ["seq", ["assert", ["and", [GE, arg, lo], [LE, arg, hi]]], arg]
+    return IRnode.from_list(arg.resolve(ret), typ=arg.typ)

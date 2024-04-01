@@ -141,18 +141,17 @@ class Floor(BuiltinFunctionT):
 
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
-        arg = args[0]
-        with arg.cache_when_complex("arg") as (b1, arg):
-            ret = IRnode.from_list(
-                [
-                    "if",
-                    ["slt", arg, 0],
-                    ["sdiv", ["sub", arg, DECIMAL_DIVISOR - 1], DECIMAL_DIVISOR],
-                    ["sdiv", arg, DECIMAL_DIVISOR],
-                ],
-                typ=INT256_T,
-            )
-            return b1.resolve(ret)
+        arg = args[0].ir_var("arg")
+        ret = IRnode.from_list(
+            [
+                "if",
+                ["slt", arg, 0],
+                ["sdiv", ["sub", arg, DECIMAL_DIVISOR - 1], DECIMAL_DIVISOR],
+                ["sdiv", arg, DECIMAL_DIVISOR],
+            ],
+            typ=INT256_T,
+        )
+        return arg.resolve(ret)
 
 
 class Ceil(BuiltinFunctionT):
@@ -172,18 +171,17 @@ class Ceil(BuiltinFunctionT):
 
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
-        arg = args[0]
-        with arg.cache_when_complex("arg") as (b1, arg):
-            ret = IRnode.from_list(
-                [
-                    "if",
-                    ["slt", arg, 0],
-                    ["sdiv", arg, DECIMAL_DIVISOR],
-                    ["sdiv", ["add", arg, DECIMAL_DIVISOR - 1], DECIMAL_DIVISOR],
-                ],
-                typ=INT256_T,
-            )
-            return b1.resolve(ret)
+        arg = args[0].ir_var("arg")
+        ret = IRnode.from_list(
+            [
+                "if",
+                ["slt", arg, 0],
+                ["sdiv", arg, DECIMAL_DIVISOR],
+                ["sdiv", ["add", arg, DECIMAL_DIVISOR - 1], DECIMAL_DIVISOR],
+            ],
+            typ=INT256_T,
+        )
+        return arg.resolve(ret)
 
 
 class Convert(BuiltinFunctionT):
@@ -233,12 +231,13 @@ ADHOC_SLICE_NODE_MACROS = ["~calldata", "~selfcode", "~extcode"]
 # valid inputs satisfy:
 #   `assert !(start+length > src_len || start+length < start`
 def _make_slice_bounds_check(start, length, src_len):
-    with start.cache_when_complex("start") as (b1, start):
-        with add_ofst(start, length).cache_when_complex("end") as (b2, end):
-            arithmetic_overflow = ["lt", end, start]
-            buffer_oob = ["gt", end, src_len]
-            ok = ["iszero", ["or", arithmetic_overflow, buffer_oob]]
-            return b1.resolve(b2.resolve(["assert", ok]))
+    start = start.ir_var("start")
+    end = add_ofst(start, length).ir_var("end")
+
+    arithmetic_overflow = ["lt", end, start]
+    buffer_oob = ["gt", end, src_len]
+    ok = ["iszero", ["or", arithmetic_overflow, buffer_oob]]
+    return start.resolve(end.resolve(["assert", ok]))
 
 
 def _build_adhoc_slice_node(sub: IRnode, start: IRnode, length: IRnode, context: Context) -> IRnode:
@@ -363,101 +362,101 @@ class Slice(BuiltinFunctionT):
             assert is_bytes32, src
             src = ensure_in_memory(src, context)
 
-        with src.cache_when_complex("src") as (b1, src), start.cache_when_complex("start") as (
-            b2,
-            start,
-        ), length.cache_when_complex("length") as (b3, length):
-            if is_bytes32:
-                src_maxlen = 32
-            else:
-                src_maxlen = src.typ.maxlen
+        src = src.ir_var("src")
+        start = start.ir_var("start")
+        length = length.ir_var("length")
 
-            dst_maxlen = length.value if length.is_literal else src_maxlen
+        if is_bytes32:
+            src_maxlen = 32
+        else:
+            src_maxlen = src.typ.maxlen
 
-            buflen = dst_maxlen
+        dst_maxlen = length.value if length.is_literal else src_maxlen
 
-            # add 32 bytes to the buffer size bc word access might
-            # be unaligned (see below)
-            if src.location == STORAGE:
-                buflen += 32
+        buflen = dst_maxlen
 
-            # Get returntype string or bytes
-            assert isinstance(src.typ, _BytestringT) or is_bytes32
-            # TODO: try to get dst_typ from semantic analysis
-            if isinstance(src.typ, StringT):
-                dst_typ = StringT(dst_maxlen)
-            else:
-                dst_typ = BytesT(dst_maxlen)
+        # add 32 bytes to the buffer size bc word access might
+        # be unaligned (see below)
+        if src.location == STORAGE:
+            buflen += 32
 
-            # allocate a buffer for the return value
-            buf = context.new_internal_variable(BytesT(buflen))
-            # assign it the correct return type.
-            # (note mismatch between dst_maxlen and buflen)
-            dst = IRnode.from_list(buf, typ=dst_typ, location=MEMORY)
+        # Get returntype string or bytes
+        assert isinstance(src.typ, _BytestringT) or is_bytes32
+        # TODO: try to get dst_typ from semantic analysis
+        if isinstance(src.typ, StringT):
+            dst_typ = StringT(dst_maxlen)
+        else:
+            dst_typ = BytesT(dst_maxlen)
 
-            dst_data = bytes_data_ptr(dst)
+        # allocate a buffer for the return value
+        buf = context.new_internal_variable(BytesT(buflen))
+        # assign it the correct return type.
+        # (note mismatch between dst_maxlen and buflen)
+        dst = IRnode.from_list(buf, typ=dst_typ, location=MEMORY)
 
-            if is_bytes32:
-                src_len = 32
-                src_data = src
-            else:
-                src_len = get_bytearray_length(src)
-                src_data = bytes_data_ptr(src)
+        dst_data = bytes_data_ptr(dst)
 
-            # general case. byte-for-byte copy
-            if src.location == STORAGE:
-                # because slice uses byte-addressing but storage
-                # is word-aligned, this algorithm starts at some number
-                # of bytes before the data section starts, and might copy
-                # an extra word. the pseudocode is:
-                #   dst_data = dst + 32
-                #   copy_dst = dst_data - start % 32
-                #   src_data = src + 32
-                #   copy_src = src_data + (start - start % 32) / 32
-                #            = src_data + (start // 32)
-                #   copy_bytes(copy_dst, copy_src, length)
-                #   //set length AFTER copy because the length word has been clobbered!
-                #   mstore(src, length)
+        if is_bytes32:
+            src_len = 32
+            src_data = src
+        else:
+            src_len = get_bytearray_length(src)
+            src_data = bytes_data_ptr(src)
 
-                # start at the first word-aligned address before `start`
-                # e.g. start == byte 7 -> we start copying from byte 0
-                #      start == byte 32 -> we start copying from byte 32
-                copy_src = IRnode.from_list(
-                    ["add", src_data, ["div", start, 32]], location=src.location
-                )
+        # general case. byte-for-byte copy
+        if src.location == STORAGE:
+            # because slice uses byte-addressing but storage
+            # is word-aligned, this algorithm starts at some number
+            # of bytes before the data section starts, and might copy
+            # an extra word. the pseudocode is:
+            #   dst_data = dst + 32
+            #   copy_dst = dst_data - start % 32
+            #   src_data = src + 32
+            #   copy_src = src_data + (start - start % 32) / 32
+            #            = src_data + (start // 32)
+            #   copy_bytes(copy_dst, copy_src, length)
+            #   //set length AFTER copy because the length word has been clobbered!
+            #   mstore(src, length)
 
-                # e.g. start == byte 0 -> we copy to dst_data + 0
-                #      start == byte 7 -> we copy to dst_data - 7
-                #      start == byte 33 -> we copy to dst_data - 1
-                copy_dst = IRnode.from_list(
-                    ["sub", dst_data, ["mod", start, 32]], location=dst.location
-                )
+            # start at the first word-aligned address before `start`
+            # e.g. start == byte 7 -> we start copying from byte 0
+            #      start == byte 32 -> we start copying from byte 32
+            copy_src = IRnode.from_list(
+                ["add", src_data, ["div", start, 32]], location=src.location
+            )
 
-                # len + (32 if start % 32 > 0 else 0)
-                copy_len = ["add", length, ["mul", 32, ["iszero", ["iszero", ["mod", start, 32]]]]]
-                copy_maxlen = buflen
+            # e.g. start == byte 0 -> we copy to dst_data + 0
+            #      start == byte 7 -> we copy to dst_data - 7
+            #      start == byte 33 -> we copy to dst_data - 1
+            copy_dst = IRnode.from_list(
+                ["sub", dst_data, ["mod", start, 32]], location=dst.location
+            )
 
-            else:
-                # all other address spaces (mem, calldata, code) we have
-                # byte-aligned access so we can just do the easy thing,
-                # memcopy(dst_data, src_data + dst_data)
+            # len + (32 if start % 32 > 0 else 0)
+            copy_len = ["add", length, ["mul", 32, ["iszero", ["iszero", ["mod", start, 32]]]]]
+            copy_maxlen = buflen
 
-                copy_src = add_ofst(src_data, start)
-                copy_dst = dst_data
-                copy_len = length
-                copy_maxlen = buflen
+        else:
+            # all other address spaces (mem, calldata, code) we have
+            # byte-aligned access so we can just do the easy thing,
+            # memcopy(dst_data, src_data + dst_data)
 
-            do_copy = copy_bytes(copy_dst, copy_src, copy_len, copy_maxlen)
+            copy_src = add_ofst(src_data, start)
+            copy_dst = dst_data
+            copy_len = length
+            copy_maxlen = buflen
 
-            ret = [
-                "seq",
-                _make_slice_bounds_check(start, length, src_len),
-                do_copy,
-                ["mstore", dst, length],  # set length
-                dst,  # return pointer to dst
-            ]
-            ret = IRnode.from_list(ret, typ=dst_typ, location=MEMORY)
-            return b1.resolve(b2.resolve(b3.resolve(ret)))
+        do_copy = copy_bytes(copy_dst, copy_src, copy_len, copy_maxlen)
+
+        ret = [
+            "seq",
+            _make_slice_bounds_check(start, length, src_len),
+            do_copy,
+            ["mstore", dst, length],  # set length
+            dst,  # return pointer to dst
+        ]
+        ret = IRnode.from_list(ret, typ=dst_typ, location=MEMORY)
+        return src.resolve(start.resolve(length.resolve(ret)))
 
 
 class Len(BuiltinFunctionT):
@@ -569,16 +568,16 @@ class Concat(BuiltinFunctionT):
                 if arg.typ.maxlen == 0:
                     continue
 
-                with arg.cache_when_complex("arg") as (b1, arg):
-                    argdata = bytes_data_ptr(arg)
+                arg = arg.ir_var('arg')
+                argdata = bytes_data_ptr(arg)
+                arglen = get_bytearray_length(arg).ir_var("len")
 
-                    with get_bytearray_length(arg).cache_when_complex("len") as (b2, arglen):
-                        do_copy = [
-                            "seq",
-                            copy_bytes(dst_data, argdata, arglen, arg.typ.maxlen),
-                            ["set", ofst, ["add", ofst, arglen]],
-                        ]
-                        ret.append(b1.resolve(b2.resolve(do_copy)))
+                do_copy = [
+                    "seq",
+                    copy_bytes(dst_data, argdata, arglen, arg.typ.maxlen),
+                    ["set", ofst, ["add", ofst, arglen]],
+                ]
+                ret.append(arg.resolve(arglen.resolve(do_copy)))
 
             else:
                 ret.append(STORE(dst_data, unwrap_location(arg)))
@@ -1018,35 +1017,35 @@ class AsWeiValue(BuiltinFunctionT):
         value = args[0]
 
         denom_divisor = self.get_denomination(expr)
-        with value.cache_when_complex("value") as (b1, value):
-            if value.typ in (UINT256_T, UINT8_T):
-                sub = [
-                    "with",
-                    "ans",
-                    ["mul", value, denom_divisor],
-                    [
-                        "seq",
-                        [
-                            "assert",
-                            ["or", ["eq", ["div", "ans", value], denom_divisor], ["iszero", value]],
-                        ],
-                        "ans",
-                    ],
-                ]
-            elif value.typ == INT128_T:
-                # signed types do not require bounds checks because the
-                # largest possible converted value will not overflow 2**256
-                sub = ["seq", ["assert", ["sgt", value, -1]], ["mul", value, denom_divisor]]
-            elif value.typ == DecimalT():
-                sub = [
+        value = value.ir_var("value")
+        if value.typ in (UINT256_T, UINT8_T):
+            sub = [
+                "with",
+                "ans",
+                ["mul", value, denom_divisor],
+                [
                     "seq",
-                    ["assert", ["sgt", value, -1]],
-                    ["div", ["mul", value, denom_divisor], DECIMAL_DIVISOR],
-                ]
-            else:
-                raise CompilerPanic(f"Unexpected type: {value.typ}")
+                    [
+                        "assert",
+                        ["or", ["eq", ["div", "ans", value], denom_divisor], ["iszero", value]],
+                    ],
+                    "ans",
+                ],
+            ]
+        elif value.typ == INT128_T:
+            # signed types do not require bounds checks because the
+            # largest possible converted value will not overflow 2**256
+            sub = ["seq", ["assert", ["sgt", value, -1]], ["mul", value, denom_divisor]]
+        elif value.typ == DecimalT():
+            sub = [
+                "seq",
+                ["assert", ["sgt", value, -1]],
+                ["div", ["mul", value, denom_divisor], DECIMAL_DIVISOR],
+            ]
+        else:
+            raise CompilerPanic(f"Unexpected type: {value.typ}")
 
-            return IRnode.from_list(b1.resolve(sub), typ=UINT256_T)
+        return IRnode.from_list(value.resolve(sub), typ=UINT256_T)
 
 
 zero_value = IRnode.from_list(0, typ=UINT256_T)
@@ -1281,10 +1280,10 @@ class RawRevert(BuiltinFunctionT):
 
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
-        with ensure_in_memory(args[0], context).cache_when_complex("err_buf") as (b, buf):
-            data = bytes_data_ptr(buf)
-            len_ = get_bytearray_length(buf)
-            return b.resolve(IRnode.from_list(["revert", data, len_]))
+        buf = ensure_in_memory(args[0], context).ir_var("err_buf")
+        data = bytes_data_ptr(buf)
+        len_ = get_bytearray_length(buf)
+        return buf.resolve(IRnode.from_list(["revert", data, len_]))
 
 
 class RawLog(BuiltinFunctionT):
@@ -1480,13 +1479,12 @@ class Shift(BuiltinFunctionT):
         # "gshr" -- generalized right shift
         argty = args[0].typ
         GSHR = sar if argty.is_signed else shr
+        arg = args[0].ir_var("to_shift")
+        bits = args[1].ir_var("bits")
 
-        with args[0].cache_when_complex("to_shift") as (b1, arg), args[1].cache_when_complex(
-            "bits"
-        ) as (b2, bits):
-            neg_bits = ["sub", 0, bits]
-            ret = ["if", ["slt", bits, 0], GSHR(neg_bits, arg), shl(bits, arg)]
-            return b1.resolve(b2.resolve(IRnode.from_list(ret, typ=argty)))
+        neg_bits = ["sub", 0, bits]
+        ret = ["if", ["slt", bits, 0], GSHR(neg_bits, arg), shl(bits, arg)]
+        return arg.resolve(bits.resolve(IRnode.from_list(ret, typ=argty)))
 
 
 class _AddMulMod(BuiltinFunctionT):
@@ -1508,13 +1506,13 @@ class _AddMulMod(BuiltinFunctionT):
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
         x, y, z = args
-        with x.cache_when_complex("x") as (b1, x):
-            with y.cache_when_complex("y") as (b2, y):
-                with z.cache_when_complex("z") as (b3, z):
-                    ret = IRnode.from_list(
-                        ["seq", ["assert", z], [self._opcode, x, y, z]], typ=UINT256_T
-                    )
-                    return b1.resolve(b2.resolve(b3.resolve(ret)))
+        x = x.ir_var("x")
+        y = y.ir_var("y")
+        z = z.ir_var("z")
+        ret = IRnode.from_list(
+            ["seq", ["assert", z], [self._opcode, x, y, z]], typ=UINT256_T
+        )
+        return x.resolve(y.resolve(z.resolve(ret)))
 
 
 class AddMod(_AddMulMod):
@@ -2037,21 +2035,19 @@ class _MinMax(BuiltinFunctionT):
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
         op = self._opcode
+        left = args[0].ir_var("_l")
+        right = args[1].ir_var("_r")
 
-        with args[0].cache_when_complex("_l") as (b1, left), args[1].cache_when_complex("_r") as (
-            b2,
-            right,
-        ):
-            if left.typ == right.typ:
-                if left.typ != UINT256_T:
-                    # if comparing like types that are not uint256, use SLT or SGT
-                    op = f"s{op}"
-                o = ["select", [op, left, right], left, right]
-                otyp = left.typ
+        if left.typ == right.typ:
+            if left.typ != UINT256_T:
+                # if comparing like types that are not uint256, use SLT or SGT
+                op = f"s{op}"
+            o = ["select", [op, left, right], left, right]
+            otyp = left.typ
 
-            else:
-                raise TypeMismatch(f"Minmax types incompatible: {left.typ.typ} {right.typ.typ}")
-            return IRnode.from_list(b1.resolve(b2.resolve(o)), typ=otyp)
+        else:
+            raise TypeMismatch(f"Minmax types incompatible: {left.typ.typ} {right.typ.typ}")
+        return IRnode.from_list(left.resolve(right.resolve(o)), typ=otyp)
 
 
 class Min(_MinMax):
@@ -2097,49 +2093,48 @@ class Uint2Str(BuiltinFunctionT):
     def build_IR(self, expr, args, kwargs, context):
         return_t = self.fetch_call_return(expr)
         n_digits = return_t.maxlen
+        val = args[0].ir_var("val")
+        buf = context.new_internal_variable(return_t)
 
-        with args[0].cache_when_complex("val") as (b1, val):
-            buf = context.new_internal_variable(return_t)
+        i = IRnode.from_list(context.fresh_varname("uint2str_i"), typ=UINT256_T)
 
-            i = IRnode.from_list(context.fresh_varname("uint2str_i"), typ=UINT256_T)
+        ret = ["repeat", i, 0, n_digits + 1, n_digits + 1]
 
-            ret = ["repeat", i, 0, n_digits + 1, n_digits + 1]
-
-            body = [
-                "seq",
-                [
-                    "if",
-                    ["eq", val, 0],
-                    # clobber val, and return it as a pointer
-                    [
-                        "seq",
-                        ["mstore", ["sub", buf + n_digits, i], i],
-                        ["set", val, ["sub", buf + n_digits, i]],
-                        "break",
-                    ],
-                    [
-                        "seq",
-                        ["mstore", ["sub", buf + n_digits, i], ["add", 48, ["mod", val, 10]]],
-                        ["set", val, ["div", val, 10]],
-                    ],
-                ],
-            ]
-            ret.append(body)
-
-            # "0" has hex representation 0x00..0130..00
-            # if (val == 0) {
-            #   return "0"
-            # } else {
-            #   do the loop
-            # }
-            ret = [
+        body = [
+            "seq",
+            [
                 "if",
                 ["eq", val, 0],
-                ["seq", ["mstore", buf + 1, ord("0")], ["mstore", buf, 1], buf],
-                ["seq", ret, val],
-            ]
+                # clobber val, and return it as a pointer
+                [
+                    "seq",
+                    ["mstore", ["sub", buf + n_digits, i], i],
+                    ["set", val, ["sub", buf + n_digits, i]],
+                    "break",
+                ],
+                [
+                    "seq",
+                    ["mstore", ["sub", buf + n_digits, i], ["add", 48, ["mod", val, 10]]],
+                    ["set", val, ["div", val, 10]],
+                ],
+            ],
+        ]
+        ret.append(body)
 
-            return b1.resolve(IRnode.from_list(ret, location=MEMORY, typ=return_t))
+        # "0" has hex representation 0x00..0130..00
+        # if (val == 0) {
+        #   return "0"
+        # } else {
+        #   do the loop
+        # }
+        ret = [
+            "if",
+            ["eq", val, 0],
+            ["seq", ["mstore", buf + 1, ord("0")], ["mstore", buf, 1], buf],
+            ["seq", ret, val],
+        ]
+
+        return val.resolve(IRnode.from_list(ret, location=MEMORY, typ=return_t))
 
 
 class Sqrt(BuiltinFunctionT):
@@ -2209,43 +2204,44 @@ class ISqrt(BuiltinFunctionT):
 
         y, z = "y", "z"
         arg = args[0]
-        with arg.cache_when_complex("x") as (b1, x):
-            ret = [
-                "seq",
-                [
-                    "if",
-                    ["ge", y, 2 ** (128 + 8)],
-                    ["seq", ["set", y, shr(128, y)], ["set", z, shl(64, z)]],
-                ],
-                [
-                    "if",
-                    ["ge", y, 2 ** (64 + 8)],
-                    ["seq", ["set", y, shr(64, y)], ["set", z, shl(32, z)]],
-                ],
-                [
-                    "if",
-                    ["ge", y, 2 ** (32 + 8)],
-                    ["seq", ["set", y, shr(32, y)], ["set", z, shl(16, z)]],
-                ],
-                [
-                    "if",
-                    ["ge", y, 2 ** (16 + 8)],
-                    ["seq", ["set", y, shr(16, y)], ["set", z, shl(8, z)]],
-                ],
-            ]
-            ret.append(["set", z, ["div", ["mul", z, ["add", y, 2**16]], 2**18]])
+        arg = arg.ir_var("x")
 
-            for _ in range(7):
-                ret.append(["set", z, ["div", ["add", ["div", x, z], z], 2]])
+        ret = [
+            "seq",
+            [
+                "if",
+                ["ge", y, 2 ** (128 + 8)],
+                ["seq", ["set", y, shr(128, y)], ["set", z, shl(64, z)]],
+            ],
+            [
+                "if",
+                ["ge", y, 2 ** (64 + 8)],
+                ["seq", ["set", y, shr(64, y)], ["set", z, shl(32, z)]],
+            ],
+            [
+                "if",
+                ["ge", y, 2 ** (32 + 8)],
+                ["seq", ["set", y, shr(32, y)], ["set", z, shl(16, z)]],
+            ],
+            [
+                "if",
+                ["ge", y, 2 ** (16 + 8)],
+                ["seq", ["set", y, shr(16, y)], ["set", z, shl(8, z)]],
+            ],
+        ]
+        ret.append(["set", z, ["div", ["mul", z, ["add", y, 2**16]], 2**18]])
 
-            # note: If ``x+1`` is a perfect square, then the Babylonian
-            # algorithm oscillates between floor(sqrt(x)) and ceil(sqrt(x)) in
-            # consecutive iterations. return the floor value always.
+        for _ in range(7):
+            ret.append(["set", z, ["div", ["add", ["div", x, z], z], 2]])
 
-            ret.append(["with", "t", ["div", x, z], ["select", ["lt", z, "t"], z, "t"]])
+        # note: If ``x+1`` is a perfect square, then the Babylonian
+        # algorithm oscillates between floor(sqrt(x)) and ceil(sqrt(x)) in
+        # consecutive iterations. return the floor value always.
 
-            ret = ["with", y, x, ["with", z, 181, ret]]
-            return b1.resolve(IRnode.from_list(ret, typ=UINT256_T))
+        ret.append(["with", "t", ["div", x, z], ["select", ["lt", z, "t"], z, "t"]])
+
+        ret = ["with", y, x, ["with", z, 181, ret]]
+        return arg.resolve(IRnode.from_list(ret, typ=UINT256_T))
 
 
 class Empty(TypenameFoldedFunctionT):
@@ -2524,43 +2520,42 @@ class ABIDecode(BuiltinFunctionT):
             )
 
         data = ensure_in_memory(data, context)
+        data = data.ir_var("to_decode")
+        data_ptr = bytes_data_ptr(data)
+        data_len = get_bytearray_length(data)
 
-        with data.cache_when_complex("to_decode") as (b1, data):
-            data_ptr = bytes_data_ptr(data)
-            data_len = get_bytearray_length(data)
+        ret = ["seq"]
 
-            ret = ["seq"]
+        if abi_min_size == abi_size_bound:
+            ret.append(["assert", ["eq", abi_min_size, data_len]])
+        else:
+            # runtime assert: abi_min_size <= data_len <= abi_size_bound
+            ret.append(clamp2(abi_min_size, data_len, abi_size_bound, signed=False))
 
-            if abi_min_size == abi_size_bound:
-                ret.append(["assert", ["eq", abi_min_size, data_len]])
-            else:
-                # runtime assert: abi_min_size <= data_len <= abi_size_bound
-                ret.append(clamp2(abi_min_size, data_len, abi_size_bound, signed=False))
+        to_decode = IRnode.from_list(
+            data_ptr,
+            typ=wrapped_typ,
+            location=data.location,
+            encoding=Encoding.ABI,
+            annotation=f"abi_decode({output_typ})",
+        )
+        to_decode.encoding = Encoding.ABI
 
-            to_decode = IRnode.from_list(
-                data_ptr,
-                typ=wrapped_typ,
-                location=data.location,
-                encoding=Encoding.ABI,
-                annotation=f"abi_decode({output_typ})",
-            )
-            to_decode.encoding = Encoding.ABI
+        # TODO optimization: skip make_setter when we don't need
+        # input validation
 
-            # TODO optimization: skip make_setter when we don't need
-            # input validation
+        output_buf = context.new_internal_variable(wrapped_typ)
+        output = IRnode.from_list(output_buf, typ=wrapped_typ, location=MEMORY)
 
-            output_buf = context.new_internal_variable(wrapped_typ)
-            output = IRnode.from_list(output_buf, typ=wrapped_typ, location=MEMORY)
+        # sanity check buffer size for wrapped output type will not buffer overflow
+        assert wrapped_typ.memory_bytes_required == output_typ.memory_bytes_required
+        ret.append(make_setter(output, to_decode))
 
-            # sanity check buffer size for wrapped output type will not buffer overflow
-            assert wrapped_typ.memory_bytes_required == output_typ.memory_bytes_required
-            ret.append(make_setter(output, to_decode))
-
-            ret.append(output)
-            # finalize. set the type and location for the return buffer.
-            # (note: unwraps the tuple type if necessary)
-            ret = IRnode.from_list(ret, typ=output_typ, location=MEMORY)
-            return b1.resolve(ret)
+        ret.append(output)
+        # finalize. set the type and location for the return buffer.
+        # (note: unwraps the tuple type if necessary)
+        ret = IRnode.from_list(ret, typ=output_typ, location=MEMORY)
+        return data.resolve(ret)
 
 
 class _MinMaxValue(TypenameFoldedFunctionT):
